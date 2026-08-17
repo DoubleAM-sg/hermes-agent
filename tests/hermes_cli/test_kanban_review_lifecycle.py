@@ -322,16 +322,16 @@ def test_complete_task_closes_review_to_done(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Wake plumbing: review_requested is a claimable terminal event for a sub
+# Wake plumbing: review_requested must not consume a subscription cursor
 # ---------------------------------------------------------------------------
 
 
-def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None:
-    """The gateway kanban-notifier wakes an origin subscription by claiming
-    unseen events whose kind is in its terminal set. ``review_requested`` is
-    now in that set, so a wake subscription must see the event — and the
-    subscription is NOT torn down (task is in ``review``, not done/archived),
-    so later review cycles keep notifying."""
+def test_review_requested_event_does_not_silence_subscription(kanban_home: Path) -> None:
+    """A review handoff is ignored by terminal notification claims.
+
+    The origin subscription must survive the handoff and remain able to claim
+    a later completion event.
+    """
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="wake me", assignee="worker")
         kb.add_notify_sub(
@@ -347,10 +347,9 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
 
-        # Same terminal set the notifier now uses (incl. review_requested).
+        # Same terminal set the notifier now uses (review_requested excluded).
         terminal_kinds = (
             "completed", "blocked", "gave_up", "crashed", "timed_out",
-            "review_requested",
         )
         _old, _new, events = kb.claim_unseen_events_for_sub(
             conn,
@@ -360,11 +359,22 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
             thread_id="T1",
             kinds=terminal_kinds,
         )
-        kinds_seen = [e.kind for e in events]
-        assert "review_requested" in kinds_seen
-        # Task is parked in review — the subscription must survive (only
-        # done/archived tears it down), so subsequent cycles still wake.
+        assert events == []
+        # Task is parked in review — the subscription must survive so a later
+        # completion can still notify the origin.
         assert kb.get_task(conn, tid).status == "review"
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+
+        assert kb.complete_task(conn, tid, summary="approved")
+        _old, _new, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="C123",
+            thread_id="T1",
+            kinds=terminal_kinds,
+        )
+        assert [event.kind for event in events] == ["completed"]
 
 
 # ---------------------------------------------------------------------------

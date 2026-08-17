@@ -458,6 +458,59 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
         conn.close()
 
 
+def test_notifier_ignores_review_requested_but_delivers_later_completion(
+    tmp_path, monkeypatch,
+):
+    """A review handoff must not silence the origin subscription."""
+    db_path = tmp_path / "review-request-notification.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="review handoff",
+            assignee="worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="origin-chat",
+        )
+        assert kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="ready for independent review",
+            expected_run_id=run_id,
+        )
+        assert kb.complete_task(conn, tid, summary="approved")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # review_requested is intentionally not a notifier terminal kind; the
+    # later completed event still reaches the same origin subscription.
+    assert len(adapter.sent) == 1
+    assert "done" in adapter.sent[0]["text"]
+    assert "ready for review" not in adapter.sent[0]["text"]
+
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     db_path = tmp_path / "chat-type-wakeup.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

@@ -588,7 +588,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
 
 @pytest.mark.asyncio
-async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_home):
+async def test_notifier_ignores_review_and_keeps_subscription(kanban_home):
     from gateway.config import Platform
     from gateway.run import GatewayRunner
 
@@ -630,8 +630,10 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
 
     real_sleep = asyncio.sleep
 
-    async def _fast_sleep(_seconds):
+    async def _fast_sleep(seconds):
         await real_sleep(0)
+        if seconds != 5:
+            runner._running = False
 
     with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
@@ -639,8 +641,7 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
             timeout=10.0,
         )
 
-    assert any("ready for review" in message for message in delivered)
-    assert any("Implementation and tests ready" in message for message in delivered)
+    assert delivered == []
     with kb.connect() as conn:
         assert kb.list_notify_subs(conn), "review is non-final; subscription must survive"
 
