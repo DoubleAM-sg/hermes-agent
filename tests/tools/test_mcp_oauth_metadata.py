@@ -116,6 +116,27 @@ class TestManagerOAuthProviderMetadata:
         assert str(provider.context.oauth_metadata.token_endpoint) == \
             "https://mgr.example.com/token"
 
+    def test_initialize_prefetches_metadata_for_cold_loaded_tokens(
+        self, tmp_path, monkeypatch
+    ):
+        """Stored tokens without metadata trigger pre-refresh discovery."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("prefetch-srv")
+        provider = _manager_provider_with_context(
+            storage,
+            oauth_metadata=None,
+            current_tokens=MagicMock(expires_in=3600),
+        )
+        prefetch = AsyncMock()
+        provider._prefetch_oauth_metadata = prefetch
+
+        with patch.object(
+            _HERMES_PROVIDER_CLS.__bases__[0], "_initialize", new=AsyncMock()
+        ):
+            asyncio.run(provider._initialize())
+
+        prefetch.assert_awaited_once_with()
+
 
     def test_async_auth_flow_persists_on_completion(self, tmp_path, monkeypatch):
         """End-to-end: running the wrapped auth_flow persists discovered metadata."""
