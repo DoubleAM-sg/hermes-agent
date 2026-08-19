@@ -133,6 +133,7 @@ class TestManagerOAuthProviderMetadata:
             return
 
         manager = MagicMock()
+        manager.begin_auth_flow.return_value = (MagicMock(), True)
         manager.invalidate_if_disk_changed = AsyncMock(return_value=False)
 
         with patch.object(

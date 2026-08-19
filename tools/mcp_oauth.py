@@ -222,6 +222,32 @@ def _find_free_port() -> int:
 _reserved_sockets: "dict[int, socket.socket]" = {}
 _MAX_RESERVED_SOCKETS = 8
 
+# Fixed callback ports can be shared by separately-created providers (for
+# example, two MCP server entries configured with the same redirect_port).
+# Coordinate ownership across event loops/threads before binding so a waiter
+# never publishes a URL for a listener that cannot bind.
+_active_callback_ports: set[int] = set()
+_active_callback_ports_guard = threading.Lock()
+_CALLBACK_PORT_CLAIM_POLL_SECONDS = 0.05
+
+
+def _try_claim_callback_port(port: int) -> bool:
+    """Claim a fixed callback port for one in-process waiter."""
+    if port == 0:
+        return True
+    with _active_callback_ports_guard:
+        if port in _active_callback_ports:
+            return False
+        _active_callback_ports.add(port)
+        return True
+
+
+def _release_callback_port(port: int) -> None:
+    if port == 0:
+        return
+    with _active_callback_ports_guard:
+        _active_callback_ports.discard(port)
+
 
 def _park_reserved_socket(port: int, sock: socket.socket) -> None:
     """Hold *sock* bound to *port* until ``_wait_for_callback`` adopts it.
@@ -946,16 +972,7 @@ def _make_callback_waiter(
             to complete the browser auth), or in non-interactive contexts.
     """
 
-    async def _wait():
-        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
-
-        dashboard_flow = get_dashboard_oauth_flow()
-        if dashboard_flow is not None:
-            # The dashboard flow still speaks the legacy tuple; normalize it
-            # here so both callback sources hand the SDK one shape.
-            dash_code, dash_state = await dashboard_flow.wait_for_callback()
-            return _authorization_code_result(dash_code, dash_state)
-
+    async def _wait_with_claimed_port():
         # Reject before binding the callback listener in non-interactive
         # contexts. Reaching here means the SDK entered the authorization-code
         # flow (a valid or refreshable token would never call the callback
@@ -1010,7 +1027,12 @@ def _make_callback_waiter(
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+            name=f"mcp-oauth-callback-{port}",
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -1040,7 +1062,14 @@ def _make_callback_waiter(
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
-            server.server_close()
+            # server_close() alone does not reliably wake a listener blocked in
+            # accept() on another thread. Stop serve_forever first and wait for
+            # the thread to exit so an immediate retry can reuse the port.
+            try:
+                server.shutdown()
+                server_thread.join(timeout=1.0)
+            finally:
+                server.server_close()
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
@@ -1065,6 +1094,35 @@ def _make_callback_waiter(
         return _authorization_code_result(
             result["auth_code"], result["state"], result.get("iss")
         )
+
+    async def _wait():
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+
+        dashboard_flow = get_dashboard_oauth_flow()
+        if dashboard_flow is not None:
+            # The dashboard flow still speaks the legacy tuple; normalize it
+            # here so both callback sources hand the SDK one shape.
+            dash_code, dash_state = await dashboard_flow.wait_for_callback()
+            return _authorization_code_result(dash_code, dash_state)
+
+        port_claimed = False
+        try:
+            # Reject before waiting for a port in non-interactive contexts.
+            # This preserves the fail-fast startup path without claiming a
+            # callback port that will never be used.
+            _raise_if_non_interactive(
+                "OAuth callback requires an interactive session but none is "
+                "available (non-interactive/background context); skipping browser "
+                "authorization without binding a callback listener."
+            )
+            while not port_claimed:
+                port_claimed = _try_claim_callback_port(port)
+                if not port_claimed:
+                    await asyncio.sleep(_CALLBACK_PORT_CLAIM_POLL_SECONDS)
+            return await _wait_with_claimed_port()
+        finally:
+            if port_claimed:
+                _release_callback_port(port)
 
     return _wait
 

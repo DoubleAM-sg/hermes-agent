@@ -565,6 +565,85 @@ class TestCallbackPortReservation:
         assert result.code == "flowA"
         assert result.state == "sA"
 
+    def test_same_pinned_port_waiters_are_serialized(self, monkeypatch):
+        """A second waiter waits instead of binding an owned pinned port."""
+        import threading
+        import tools.mcp_oauth as mod
+
+        port = _find_free_port()
+        monkeypatch.setattr(mod, "_is_interactive", lambda: False)
+        monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda lead: None)
+
+        async def drive():
+            real_http_server = mod.HTTPServer
+            first_active = asyncio.Event()
+            second_active = asyncio.Event()
+            activation_count = 0
+
+            class RecordingHTTPServer(real_http_server):
+                def server_activate(self):
+                    nonlocal activation_count
+                    super().server_activate()
+                    activation_count += 1
+                    (first_active if activation_count == 1 else second_active).set()
+
+            monkeypatch.setattr(mod, "HTTPServer", RecordingHTTPServer)
+
+            first = asyncio.create_task(mod._make_callback_waiter(port)())
+            await asyncio.wait_for(first_active.wait(), timeout=2)
+
+            second = asyncio.create_task(mod._make_callback_waiter(port)())
+            await asyncio.sleep(0)
+            assert not second.done()
+            assert activation_count == 1
+
+            threading.Thread(
+                target=_hit_callback_when_ready,
+                args=(f"http://127.0.0.1:{port}/callback?code=first&state=s1",),
+                daemon=True,
+            ).start()
+            assert (await asyncio.wait_for(first, timeout=2)).code == "first"
+
+            await asyncio.wait_for(second_active.wait(), timeout=2)
+            threading.Thread(
+                target=_hit_callback_when_ready,
+                args=(f"http://127.0.0.1:{port}/callback?code=second&state=s2",),
+                daemon=True,
+            ).start()
+            assert (await asyncio.wait_for(second, timeout=2)).code == "second"
+
+        asyncio.run(drive())
+
+    def test_cancelled_waiter_releases_listener(self, monkeypatch):
+        """Cancelling a pending callback waiter must close its listener."""
+        import socket
+        import tools.mcp_oauth as mod
+
+        port = _find_free_port()
+        monkeypatch.setattr(mod, "_is_interactive", lambda: False)
+        monkeypatch.setattr(mod, "_raise_if_non_interactive", lambda lead: None)
+
+        async def drive():
+            real_http_server = mod.HTTPServer
+            active = asyncio.Event()
+
+            class RecordingHTTPServer(real_http_server):
+                def server_activate(self):
+                    super().server_activate()
+                    active.set()
+
+            monkeypatch.setattr(mod, "HTTPServer", RecordingHTTPServer)
+            waiter = asyncio.create_task(mod._make_callback_waiter(port)())
+            await asyncio.wait_for(active.wait(), timeout=2)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            with socket.socket() as rebound:
+                rebound.bind(("127.0.0.1", port))
+
+        asyncio.run(drive())
+
 
 # ---------------------------------------------------------------------------
 # remove_oauth_tokens

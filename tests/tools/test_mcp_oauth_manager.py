@@ -84,6 +84,466 @@ def test_hermes_provider_subclass_exists():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_auth_flows_publish_one_authorization_url_while_pending(
+    tmp_path, monkeypatch
+):
+    """Concurrent 401 retries must share one pending browser authorization.
+
+    The MCP SDK's provider lock is an implementation detail of one provider
+    instance and does not protect the Hermes boundary when the SDK driver is
+    re-entered concurrently. A second request must wait for the first user's
+    consent instead of generating a second PKCE state that can overwrite the
+    callback the user authorized.
+    """
+    from urllib.parse import parse_qs, urlparse
+    from unittest.mock import MagicMock
+
+    from mcp.shared.auth import AuthorizationCodeResult
+    import tools.mcp_oauth_manager as manager_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    manager = manager_module.MCPOAuthManager()
+    monkeypatch.setattr(manager_module, "get_manager", lambda: manager)
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    published_states: list[str] = []
+    consent_complete = asyncio.Event()
+
+    async def publish_authorization_url(url: str) -> None:
+        state = parse_qs(urlparse(url).query)["state"][0]
+        published_states.append(state)
+
+    async def wait_for_callback() -> AuthorizationCodeResult:
+        await consent_complete.wait()
+        return AuthorizationCodeResult(
+            code="authorization-code",
+            state=published_states[0],
+            iss=None,
+        )
+
+    provider.context.redirect_handler = publish_authorization_url
+    provider.context.callback_handler = wait_for_callback
+
+    async def fake_authorization_code_grant(self):
+        state = f"state-{len(published_states) + 1}"
+        await self.context.redirect_handler(
+            f"https://idp.example/authorize?state={state}"
+        )
+        result = await self.context.callback_handler()
+        if result.state != state:
+            raise RuntimeError("authorization callback state mismatch")
+        return result.code, "code-verifier"
+
+    async def fake_sdk_auth_flow(self, request):
+        response = yield request
+        if response.status_code == 401 and not getattr(self, "_test_token", False):
+            await self._perform_authorization_code_grant()
+            self._test_token = True
+        yield request
+
+    monkeypatch.setattr(
+        type(provider),
+        "_perform_authorization_code_grant",
+        fake_authorization_code_grant,
+    )
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+
+    async def drive_request():
+        flow = provider.async_auth_flow(object())
+        await flow.__anext__()
+        retry_request = await flow.asend(MagicMock(status_code=401))
+        assert retry_request is not None
+        try:
+            await flow.asend(MagicMock(status_code=200))
+        except StopAsyncIteration:
+            pass
+
+    first = asyncio.create_task(drive_request())
+    await asyncio.sleep(0)
+    second = asyncio.create_task(drive_request())
+    await asyncio.sleep(0.05)
+    only_one_pending = len(published_states) == 1
+    consent_complete.set()
+    outcomes = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert only_one_pending
+    assert published_states == ["state-1"]
+    assert outcomes == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_normal_requests_are_not_blocked_by_auth_single_flight(
+    tmp_path, monkeypatch
+):
+    """A pending ordinary request must not gate another request's auth flow."""
+    import tools.mcp_oauth_manager as manager_module
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    manager = manager_module.MCPOAuthManager()
+    monkeypatch.setattr(manager_module, "get_manager", lambda: manager)
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    async def fake_sdk_auth_flow(self, request):
+        yield request
+
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+
+    first = provider.async_auth_flow(object())
+    assert await first.__anext__() is not None
+
+    second = provider.async_auth_flow(object())
+    second_step = asyncio.create_task(second.__anext__())
+    try:
+        second_request = await asyncio.wait_for(
+            asyncio.shield(second_step), timeout=0.2
+        )
+    finally:
+        if not second_step.done():
+            second_step.cancel()
+        await asyncio.gather(second_step, return_exceptions=True)
+
+    assert second_request is not None
+    await first.aclose()
+    await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_normal_requests_are_not_blocked_by_context_lock(
+    tmp_path, monkeypatch
+):
+    """Concurrent ordinary requests must cross the real SDK lock boundary."""
+    import httpx2
+
+    import tools.mcp_oauth_manager as manager_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    manager = manager_module.MCPOAuthManager()
+    monkeypatch.setattr(manager_module, "get_manager", lambda: manager)
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    async def initialize_without_tokens():
+        provider._initialized = True
+        provider.context.current_tokens = None
+
+    provider._initialize = initialize_without_tokens
+
+    first = provider.async_auth_flow(httpx2.Request("GET", "https://example.com/one"))
+    assert await first.__anext__() is not None
+
+    second_ready = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def drive_second():
+        second = provider.async_auth_flow(
+            httpx2.Request("GET", "https://example.com/two")
+        )
+        second_request = await second.__anext__()
+        second_ready.set()
+        await release_second.wait()
+        await second.aclose()
+        return second_request
+
+    second_step = asyncio.create_task(drive_second())
+    await asyncio.wait_for(second_ready.wait(), timeout=0.2)
+    release_second.set()
+    second_request = await second_step
+    await first.aclose()
+
+    assert second_request is not None
+
+
+@pytest.mark.asyncio
+async def test_sequential_initial_retry_reuses_pending_authorization_grant(
+    tmp_path, monkeypatch
+):
+    """A cancelled initial attempt must not publish a replacement PKCE state.
+
+    ``MCPServerTask`` retries an initial HTTP connection after transient
+    failures. If that cancellation lands while the browser callback is still
+    pending, the next attempt must join the original authorization grant
+    instead of publishing a second URL against the same callback listener.
+    """
+    from unittest.mock import MagicMock
+
+    import tools.mcp_oauth_manager as manager_module
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    manager = manager_module.MCPOAuthManager()
+    monkeypatch.setattr(manager_module, "get_manager", lambda: manager)
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    published_states: list[str] = []
+    grant_started = asyncio.Event()
+    consent_complete = asyncio.Event()
+
+    async def fake_authorization_code_grant(self):
+        state = f"state-{len(published_states) + 1}"
+        published_states.append(state)
+        grant_started.set()
+        await consent_complete.wait()
+        return "authorization-code", "code-verifier"
+
+    async def fake_sdk_auth_flow(self, request):
+        response = yield request
+        if response.status_code == 401:
+            await self._perform_authorization_code_grant()
+        yield request
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization_code_grant",
+        fake_authorization_code_grant,
+    )
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+
+    async def begin_flow():
+        flow = provider.async_auth_flow(object())
+        await flow.__anext__()
+        return flow
+
+    first_flow = await begin_flow()
+    first_attempt = asyncio.create_task(
+        first_flow.asend(MagicMock(status_code=401))
+    )
+    await grant_started.wait()
+
+    first_attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_attempt
+
+    second_flow = await begin_flow()
+    second_attempt = asyncio.create_task(
+        second_flow.asend(MagicMock(status_code=401))
+    )
+    await asyncio.sleep(0.05)
+    assert published_states == ["state-1"]
+
+    consent_complete.set()
+    assert await second_attempt is not None
+    try:
+        await second_flow.asend(MagicMock(status_code=200))
+    except StopAsyncIteration:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_sequential_retry_cli_style_smoke_keeps_one_real_callback_listener(
+    tmp_path, monkeypatch
+):
+    """A retry interval during consent keeps one URL and one live listener."""
+    import urllib.request
+    from unittest.mock import MagicMock
+
+    import tools.mcp_oauth as oauth_module
+    import tools.mcp_oauth_manager as manager_module
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    port = oauth_module._find_free_port()
+    manager = manager_module.MCPOAuthManager()
+    monkeypatch.setattr(manager_module, "get_manager", lambda: manager)
+    provider = manager.get_or_build_provider(
+        "tiktok",
+        "https://open.tiktokapis.com/mcp",
+        {"redirect_port": port, "timeout": 5},
+    )
+    assert provider is not None
+
+    published_states: list[str] = []
+
+    async def publish_authorization_url(url: str) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        published_states.append(parse_qs(urlparse(url).query)["state"][0])
+
+    provider.context.redirect_handler = publish_authorization_url
+
+    async def fake_authorization_code_grant(self):
+        state = f"state-{len(published_states) + 1}"
+        await self.context.redirect_handler(
+            f"https://idp.example/authorize?state={state}"
+        )
+        result = await self.context.callback_handler()
+        assert result.state == state
+        return result.code, "code-verifier"
+
+    async def fake_sdk_auth_flow(self, request):
+        response = yield request
+        if response.status_code == 401:
+            await self._perform_authorization_code_grant()
+        yield request
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization_code_grant",
+        fake_authorization_code_grant,
+    )
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+
+    flow = provider.async_auth_flow(object())
+    await flow.__anext__()
+    first_attempt = asyncio.create_task(flow.asend(MagicMock(status_code=401)))
+    for _ in range(100):
+        if published_states:
+            break
+        await asyncio.sleep(0.01)
+    assert published_states == ["state-1"]
+
+    # Model the initial-connect retry interval: the first auth-flow generator
+    # is cancelled, but browser consent remains pending on its real listener.
+    first_attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_attempt
+    await asyncio.sleep(0.1)
+
+    retry_flow = provider.async_auth_flow(object())
+    await retry_flow.__anext__()
+    retry_attempt = asyncio.create_task(
+        retry_flow.asend(MagicMock(status_code=401))
+    )
+    await asyncio.sleep(0.1)
+    assert published_states == ["state-1"]
+
+    await asyncio.to_thread(
+        urllib.request.urlopen,
+        f"http://127.0.0.1:{port}/callback?code=authorization-code&state=state-1",
+    )
+    assert await retry_attempt is not None
+    try:
+        await retry_flow.asend(MagicMock(status_code=200))
+    except StopAsyncIteration:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_sequential_retry_mcp_session_harness_uses_one_authorization_url(
+    tmp_path, monkeypatch
+):
+    """The MCPServerTask initial-retry loop keeps the original grant alive."""
+    import urllib.request
+    from unittest.mock import MagicMock
+
+    import tools.mcp_oauth as oauth_module
+    import tools.mcp_oauth_manager as manager_module
+    import tools.mcp_tool as mcp_tool_module
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_tool import MCPServerTask
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    port = oauth_module._find_free_port()
+    manager = manager_module.MCPOAuthManager()
+    monkeypatch.setattr(manager_module, "get_manager", lambda: manager)
+    provider = manager.get_or_build_provider(
+        "tiktok",
+        "https://open.tiktokapis.com/mcp",
+        {"redirect_port": port, "timeout": 5},
+    )
+    assert provider is not None
+
+    published_states: list[str] = []
+
+    async def publish_authorization_url(url: str) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        published_states.append(parse_qs(urlparse(url).query)["state"][0])
+
+    provider.context.redirect_handler = publish_authorization_url
+
+    async def fake_authorization_code_grant(self):
+        state = f"state-{len(published_states) + 1}"
+        await self.context.redirect_handler(
+            f"https://idp.example/authorize?state={state}"
+        )
+        result = await self.context.callback_handler()
+        assert result.state == state
+        return result.code, "code-verifier"
+
+    async def fake_sdk_auth_flow(self, request):
+        response = yield request
+        if response.status_code == 401:
+            await self._perform_authorization_code_grant()
+        yield request
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization_code_grant",
+        fake_authorization_code_grant,
+    )
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+    monkeypatch.setattr(mcp_tool_module, "_jittered", lambda seconds: seconds)
+
+    class HarnessTask(MCPServerTask):
+        def __init__(self, name: str):
+            super().__init__(name)
+            self.attempt = 0
+
+        async def _run_http(self, config: dict):
+            self.attempt += 1
+            flow = provider.async_auth_flow(object())
+            await flow.__anext__()
+            attempt = asyncio.create_task(flow.asend(MagicMock(status_code=401)))
+
+            if self.attempt == 1:
+                for _ in range(100):
+                    if published_states:
+                        break
+                    await asyncio.sleep(0.01)
+                assert published_states == ["state-1"]
+                attempt.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await attempt
+                raise OSError("simulated initial transport retry")
+
+            await asyncio.sleep(0.1)
+            assert published_states == ["state-1"]
+            await asyncio.to_thread(
+                urllib.request.urlopen,
+                f"http://127.0.0.1:{port}/callback?code=authorization-code&state=state-1",
+            )
+            assert await attempt is not None
+            try:
+                await flow.asend(MagicMock(status_code=200))
+            except StopAsyncIteration:
+                pass
+            self._shutdown_event.set()
+            return "shutdown"
+
+    server = HarnessTask("tiktok")
+    await asyncio.wait_for(
+        server.run({
+            "url": "https://open.tiktokapis.com/mcp",
+            "auth": "oauth",
+            "connect_timeout": 5,
+        }),
+        timeout=5,
+    )
+    assert server.attempt == 2
+    assert published_states == ["state-1"]
+
+
+@pytest.mark.asyncio
 async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     """When the tokens file mtime changes, provider._initialized flips False.
 
