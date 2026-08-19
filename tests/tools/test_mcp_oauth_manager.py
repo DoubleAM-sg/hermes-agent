@@ -89,7 +89,9 @@ async def test_real_sdk_normal_requests_are_not_blocked_by_context_lock(
     tmp_path, monkeypatch
 ):
     """Concurrent ordinary requests cross the installed SDK lock boundary."""
-    import httpx2 as sdk_httpx
+    from mcp.client.auth import oauth2 as sdk_oauth2
+
+    sdk_httpx = sdk_oauth2.httpx2
 
     from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
 
