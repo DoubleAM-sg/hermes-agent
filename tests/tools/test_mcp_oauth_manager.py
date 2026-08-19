@@ -4,6 +4,7 @@ The manager consolidates the eight scattered MCP-OAuth call sites into a
 single object with disk-mtime watch, dedup'd 401 handling, and a provider
 cache. See `tools/mcp_oauth_manager.py` for design rationale.
 """
+import asyncio
 import json
 import os
 import time
@@ -81,6 +82,332 @@ def test_hermes_provider_subclass_exists():
 
     assert _HERMES_PROVIDER_CLS is not None
     assert issubclass(_HERMES_PROVIDER_CLS, OAuthClientProvider)
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_normal_requests_are_not_blocked_by_context_lock(
+    tmp_path, monkeypatch
+):
+    """Concurrent ordinary requests cross the installed SDK lock boundary."""
+    import httpx2 as sdk_httpx
+
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    reset_manager_for_tests()
+    manager = MCPOAuthManager()
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    async def initialize_without_tokens():
+        provider._initialized = True
+        provider.context.current_tokens = None
+
+    provider._initialize = initialize_without_tokens
+
+    first = provider.async_auth_flow(
+        sdk_httpx.Request("GET", "https://example.com/one")
+    )
+    assert await first.__anext__() is not None
+
+    second_ready = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def drive_second():
+        second = provider.async_auth_flow(
+            sdk_httpx.Request("GET", "https://example.com/two")
+        )
+        request = await second.__anext__()
+        second_ready.set()
+        await release_second.wait()
+        await second.aclose()
+        return request
+
+    second_task = asyncio.create_task(drive_second())
+    await asyncio.wait_for(second_ready.wait(), timeout=0.2)
+    release_second.set()
+    second_request = await second_task
+    await first.aclose()
+
+    assert second_request.url.path == "/two"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_401_challenges_publish_one_authorization_flow(
+    tmp_path, monkeypatch
+):
+    """Identical challenges single-flight while distinct challenges do not."""
+    from unittest.mock import MagicMock
+
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    reset_manager_for_tests()
+    manager = MCPOAuthManager()
+    monkeypatch.setattr(
+        "tools.mcp_oauth_manager.get_manager", lambda: manager
+    )
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    grant_started = asyncio.Event()
+    grant_release = asyncio.Event()
+    grant_calls = 0
+
+    async def fake_grant(self):
+        nonlocal grant_calls
+        grant_calls += 1
+        grant_started.set()
+        await grant_release.wait()
+        return "authorization-code", "code-verifier"
+
+    async def fake_sdk_auth_flow(self, request):
+        response = yield request
+        if response.status_code == 401:
+            await self._perform_authorization_code_grant()
+        yield request
+
+    monkeypatch.setattr(type(provider), "_perform_authorization_code_grant", fake_grant)
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+
+    async def drive(challenge):
+        flow = provider.async_auth_flow(object())
+        await flow.__anext__()
+        retry_request = await flow.asend(
+            MagicMock(
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": (
+                        'Bearer resource_metadata="https://auth.example/'
+                        f'{challenge}" scope="{challenge}"'
+                    )
+                },
+            )
+        )
+        try:
+            await flow.asend(MagicMock(status_code=200))
+        except StopAsyncIteration:
+            pass
+        return retry_request
+
+    first = asyncio.create_task(drive("read"))
+    await grant_started.wait()
+    second_same_challenge = asyncio.create_task(drive("read"))
+    third_distinct_challenge = asyncio.create_task(drive("write"))
+
+    async def wait_for_independent_grant():
+        while grant_calls < 2:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_independent_grant(), timeout=0.2)
+    assert grant_calls == 2
+
+    grant_release.set()
+    retry_requests = await asyncio.gather(
+        first, second_same_challenge, third_distinct_challenge
+    )
+    assert len(retry_requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_cancelled_grant_is_reused_by_sequential_retry(tmp_path, monkeypatch):
+    """Cancelling one HTTP attempt does not start a second browser grant."""
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    reset_manager_for_tests()
+    manager = MCPOAuthManager()
+    monkeypatch.setattr(
+        "tools.mcp_oauth_manager.get_manager", lambda: manager
+    )
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    grant_started = asyncio.Event()
+    grant_release = asyncio.Event()
+    grant_calls = 0
+
+    async def fake_base_grant(self):
+        nonlocal grant_calls
+        grant_calls += 1
+        grant_started.set()
+        await grant_release.wait()
+        return "authorization-code", "code-verifier"
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization_code_grant",
+        fake_base_grant,
+    )
+
+    first = asyncio.create_task(provider._perform_authorization_code_grant())
+    await grant_started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    second = asyncio.create_task(provider._perform_authorization_code_grant())
+    await asyncio.sleep(0.05)
+    assert grant_calls == 1
+
+    grant_release.set()
+    assert await second == ("authorization-code", "code-verifier")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_auth_flow_retry_reuses_one_grant(tmp_path, monkeypatch):
+    """A cancelled 401 auth generator reuses its pending browser grant."""
+    from unittest.mock import MagicMock
+
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    reset_manager_for_tests()
+    manager = MCPOAuthManager()
+    monkeypatch.setattr(
+        "tools.mcp_oauth_manager.get_manager", lambda: manager
+    )
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    grant_started = asyncio.Event()
+    grant_release = asyncio.Event()
+    grant_calls = 0
+
+    async def fake_base_grant(self):
+        nonlocal grant_calls
+        grant_calls += 1
+        grant_started.set()
+        await grant_release.wait()
+        return "authorization-code", "code-verifier"
+
+    async def fake_sdk_auth_flow(self, request):
+        response = yield request
+        if response.status_code == 401:
+            await self._perform_authorization_code_grant()
+        yield request
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization_code_grant",
+        fake_base_grant,
+    )
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+
+    first_flow = provider.async_auth_flow(object())
+    await first_flow.__anext__()
+    first_attempt = asyncio.create_task(
+        first_flow.asend(MagicMock(status_code=401))
+    )
+    await grant_started.wait()
+    first_attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_attempt
+
+    retry_flow = provider.async_auth_flow(object())
+    await retry_flow.__anext__()
+    retry_attempt = asyncio.create_task(
+        retry_flow.asend(MagicMock(status_code=401))
+    )
+    await asyncio.sleep(0.05)
+    assert grant_calls == 1
+
+    grant_release.set()
+    assert await retry_attempt is not None
+    try:
+        await retry_flow.asend(MagicMock(status_code=200))
+    except StopAsyncIteration:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_ordinary_flow_does_not_clear_pending_default_grant(tmp_path, monkeypatch):
+    """An ordinary request cannot disrupt a cancelled default-challenge retry."""
+    from unittest.mock import MagicMock
+
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    reset_manager_for_tests()
+    manager = MCPOAuthManager()
+    monkeypatch.setattr(
+        "tools.mcp_oauth_manager.get_manager", lambda: manager
+    )
+    provider = manager.get_or_build_provider(
+        "tiktok", "https://open.tiktokapis.com/mcp", None
+    )
+    assert provider is not None
+
+    grant_started = asyncio.Event()
+    grant_release = asyncio.Event()
+    grant_calls = 0
+
+    async def fake_base_grant(self):
+        nonlocal grant_calls
+        grant_calls += 1
+        grant_started.set()
+        await grant_release.wait()
+        return "authorization-code", "code-verifier"
+
+    async def fake_sdk_auth_flow(self, request):
+        response = yield request
+        if response.status_code == 401:
+            await self._perform_authorization_code_grant()
+        yield request
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization_code_grant",
+        fake_base_grant,
+    )
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_sdk_auth_flow)
+
+    first_flow = provider.async_auth_flow(object())
+    await first_flow.__anext__()
+    first_attempt = asyncio.create_task(
+        first_flow.asend(MagicMock(status_code=401))
+    )
+    await grant_started.wait()
+    first_attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_attempt
+
+    ordinary_flow = provider.async_auth_flow(object())
+    await ordinary_flow.__anext__()
+    await ordinary_flow.asend(MagicMock(status_code=200))
+    await ordinary_flow.aclose()
+
+    retry_flow = provider.async_auth_flow(object())
+    await retry_flow.__anext__()
+    retry_attempt = asyncio.create_task(
+        retry_flow.asend(MagicMock(status_code=401))
+    )
+    await asyncio.sleep(0.05)
+    assert grant_calls == 1
+
+    grant_release.set()
+    assert await retry_attempt is not None
+    try:
+        await retry_flow.asend(MagicMock(status_code=200))
+    except StopAsyncIteration:
+        pass
 
 
 @pytest.mark.asyncio

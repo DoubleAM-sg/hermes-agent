@@ -214,6 +214,31 @@ def _find_free_port() -> int:
 _reserved_sockets: "dict[int, socket.socket]" = {}
 _MAX_RESERVED_SOCKETS = 8
 
+# Fixed callback ports can be configured for more than one OAuth flow. Claim
+# them before binding so concurrent waiters serialize instead of racing into a
+# misleading "address already in use" failure.
+_active_callback_ports: set[int] = set()
+_active_callback_ports_guard = threading.Lock()
+_CALLBACK_PORT_CLAIM_POLL_SECONDS = 0.05
+
+
+def _try_claim_callback_port(port: int) -> bool:
+    """Claim a callback port for one in-process OAuth waiter."""
+    if port == 0:
+        return True
+    with _active_callback_ports_guard:
+        if port in _active_callback_ports:
+            return False
+        _active_callback_ports.add(port)
+        return True
+
+
+def _release_callback_port(port: int) -> None:
+    if port == 0:
+        return
+    with _active_callback_ports_guard:
+        _active_callback_ports.discard(port)
+
 
 def _reserve_callback_port() -> int:
     """Pick an ephemeral callback port and keep its socket bound.
@@ -650,6 +675,22 @@ class HermesTokenStorage:
 # ---------------------------------------------------------------------------
 
 
+def _authorization_code_result(
+    code: str, state: str | None, iss: str | None = None
+):
+    """Return the callback shape expected by the installed MCP SDK.
+
+    MCP 2.x changed callback handlers from returning ``(code, state)`` to an
+    ``AuthorizationCodeResult`` model. Keep the tuple fallback for older SDKs
+    and for the legacy ``_wait_for_callback`` compatibility function.
+    """
+    try:
+        from mcp.shared.auth import AuthorizationCodeResult
+    except ImportError:  # pragma: no cover - older MCP SDK
+        return code, state
+    return AuthorizationCodeResult(code=code, state=state, iss=iss)
+
+
 def _make_callback_handler() -> tuple[type, dict]:
     """Create a per-flow callback HTTP handler class with its own result dict.
 
@@ -658,7 +699,12 @@ def _make_callback_handler() -> tuple[type, dict]:
     OAuth redirect arrives.  Each call returns a fresh pair so concurrent
     flows don't stomp on each other.
     """
-    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None}
+    result: dict[str, Any] = {
+        "auth_code": None,
+        "state": None,
+        "error": None,
+        "iss": None,
+    }
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -666,10 +712,12 @@ def _make_callback_handler() -> tuple[type, dict]:
             code = params.get("code", [None])[0]
             state = params.get("state", [None])[0]
             error = params.get("error", [None])[0]
+            iss = params.get("iss", [None])[0]
 
             result["auth_code"] = code
             result["state"] = state
             result["error"] = error
+            result["iss"] = iss
 
             body = (
                 "<html><body><h2>Authorization Successful</h2>"
@@ -809,10 +857,18 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             "OAuth callback port not set — build_oauth_auth must be called "
             "before _wait_for_oauth_callback"
         )
-    return await _make_callback_waiter(_oauth_port)()
+    result = await _make_callback_waiter(_oauth_port, sdk_result=False)()
+    if isinstance(result, tuple):
+        return result
+    return result.code, result.state
 
 
-def _make_callback_waiter(port: int):
+def _make_callback_waiter(
+    port: int,
+    *,
+    timeout: float = 300.0,
+    sdk_result: bool = False,
+):
     """Return a callback waiter bound to a single OAuth flow's port.
 
     Closing over the port (instead of reading the module-level
@@ -831,24 +887,11 @@ def _make_callback_waiter(port: int):
             to complete the browser auth), or in non-interactive contexts.
     """
 
-    async def _wait() -> tuple[str, str | None]:
-        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
-
-        dashboard_flow = get_dashboard_oauth_flow()
-        if dashboard_flow is not None:
-            return await dashboard_flow.wait_for_callback()
-
+    async def _wait_with_claimed_port():
         # Reject before binding the callback listener in non-interactive
         # contexts. Reaching here means the SDK entered the authorization-code
-        # flow (a valid or refreshable token would never call the callback
-        # handler), so a cached token file is present but unusable. Binding the
-        # listener here would block for the full 300s timeout and — on the next
-        # connection retry — collide with the still-bound/TIME_WAIT port,
-        # surfacing as ``OSError: [Errno 98] Address already in use``. Failing
-        # fast keeps gateway startup independent of an unusable optional MCP
-        # server. This guard holds "regardless of whether a token file exists"
-        # — the point the build_oauth_auth token-file guard cannot cover.
-        # See #57836.
+        # flow with no usable cached token, so waiting for a browser would
+        # otherwise stall startup for the full callback timeout.
         _raise_if_non_interactive(
             "OAuth callback requires an interactive session but none is "
             "available (non-interactive/background context); skipping browser "
@@ -857,49 +900,45 @@ def _make_callback_waiter(port: int):
 
         handler_cls, result = _make_callback_handler()
 
-        # Start a temporary server on this flow's port, adopting the socket
-        # reserved at port-selection time when one exists. Holding the bound
-        # socket from _reserve_callback_port() until here closes the TOCTOU
-        # window where another process could steal the port between selection
-        # and bind (#22161). allow_reuse_address is set BEFORE binding (setting
-        # it after the constructor has already bound is a no-op) so a lingering
-        # TIME_WAIT socket from a previous flow cannot block the next one
-        # (#44590).
+        server = None
+        reserved = None
         try:
             server = HTTPServer(
                 ("127.0.0.1", port), handler_cls, bind_and_activate=False
             )
             reserved = _reserved_sockets.pop(port, None)
             if reserved is not None:
-                # Adopt the reserved (already bound) socket and start listening.
+                # Adopt the socket reserved by _configure_callback_port().
                 server.socket.close()
                 server.socket = reserved
                 server.server_address = reserved.getsockname()
                 server.server_activate()
+                reserved = None
             else:
                 server.allow_reuse_address = True
                 server.server_bind()
                 server.server_activate()
         except OSError as exc:
-            # The loopback callback port is genuinely in use: a concurrent OAuth
-            # flow, a leftover listener, or a fixed `oauth.redirect_port` that
-            # collided. build_oauth_auth does not start its own callback server,
-            # so there is nothing to poll here; surface a clear, actionable error
-            # instead of a misleading "timed out".
+            if reserved is not None:
+                _reserved_sockets[port] = reserved
+            if server is not None:
+                server.server_close()
             raise OAuthNonInteractiveError(
                 f"OAuth callback port {port} is already in use ({exc}). "
-                "Close any other in-progress login, or set a free `oauth.redirect_port` "
-                "in the server config, then retry."
+                "Close any other in-progress login, or set a free "
+                "`oauth.redirect_port` in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+            name=f"mcp-oauth-callback-{port}",
+        )
         server_thread.start()
 
-        # Optional paste-fallback thread: only on interactive TTYs. Reads one
-        # line from stdin and writes the parsed code/state into the shared
-        # result dict. The HTTP listener and this thread race for the result;
-        # whichever fills it first wins.
-        paste_thread: threading.Thread | None = None
+        # Optional paste-fallback thread: only on interactive TTYs. It races
+        # the HTTP listener and writes into the same per-flow result dict.
         if _is_interactive():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
@@ -908,22 +947,27 @@ def _make_callback_waiter(port: int):
                 file=sys.stderr,
                 flush=True,
             )
-            paste_thread = threading.Thread(
+            threading.Thread(
                 target=_paste_callback_reader, args=(result,), daemon=True
-            )
-            paste_thread.start()
+            ).start()
 
-        timeout = 300.0
         poll_interval = 0.5
         elapsed = 0.0
         try:
-            while elapsed < timeout:
+            while elapsed < max(0.0, float(timeout)):
                 if result["auth_code"] is not None or result["error"] is not None:
                     break
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
-            server.server_close()
+            # server_close() alone does not reliably wake serve_forever() from
+            # another thread. Stop it first so cancellation releases a fixed
+            # port for the next retry.
+            try:
+                server.shutdown()
+                server_thread.join(timeout=1.0)
+            finally:
+                server.server_close()
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
@@ -935,7 +979,37 @@ def _make_callback_waiter(port: int):
                 "Ensure you completed the browser authorization flow."
             )
 
+        if sdk_result:
+            return _authorization_code_result(
+                result["auth_code"], result["state"], result.get("iss")
+            )
         return result["auth_code"], result["state"]
+
+    async def _wait():
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+
+        dashboard_flow = get_dashboard_oauth_flow()
+        if dashboard_flow is not None:
+            dash_code, dash_state = await dashboard_flow.wait_for_callback()
+            if sdk_result:
+                return _authorization_code_result(dash_code, dash_state)
+            return dash_code, dash_state
+
+        claimed = False
+        try:
+            _raise_if_non_interactive(
+                "OAuth callback requires an interactive session but none is "
+                "available (non-interactive/background context); skipping browser "
+                "authorization without binding a callback listener."
+            )
+            while not claimed:
+                claimed = _try_claim_callback_port(port)
+                if not claimed:
+                    await asyncio.sleep(_CALLBACK_PORT_CLAIM_POLL_SECONDS)
+            return await _wait_with_claimed_port()
+        finally:
+            if claimed:
+                _release_callback_port(port)
 
     return _wait
 
@@ -1005,6 +1079,7 @@ def _paste_callback_reader(result: dict) -> None:
     code = params.get("code", [None])[0]
     state = params.get("state", [None])[0]
     error = params.get("error", [None])[0]
+    iss = params.get("iss", [None])[0]
 
     if not code and not error:
         print(
@@ -1020,6 +1095,7 @@ def _paste_callback_reader(result: dict) -> None:
     result["auth_code"] = code
     result["state"] = state
     result["error"] = error
+    result["iss"] = iss
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
@@ -1357,7 +1433,11 @@ def build_oauth_auth(
     redirect_handler = _make_redirect_handler(
         resolved_port, redirect_uri=cfg.get("redirect_uri") or None
     )
-    callback_handler = _make_callback_waiter(resolved_port)
+    callback_handler = _make_callback_waiter(
+        resolved_port,
+        timeout=float(cfg.get("timeout", 300)),
+        sdk_result=True,
+    )
 
     return OAuthClientProvider(
         server_url=server_url,
@@ -1365,5 +1445,4 @@ def build_oauth_auth(
         storage=storage,
         redirect_handler=redirect_handler,
         callback_handler=callback_handler,
-        timeout=float(cfg.get("timeout", 300)),
     )

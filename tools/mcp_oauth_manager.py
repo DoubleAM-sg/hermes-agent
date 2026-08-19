@@ -35,14 +35,21 @@ Design reference:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import re
 import threading
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+_AUTH_FLOW_POLL_INTERVAL = 0.05
+_DEFAULT_AUTH_CHALLENGE_KEY = "<default>"
+_CURRENT_AUTH_CHALLENGE_KEY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mcp_oauth_auth_challenge_key", default=None
+)
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -63,6 +70,61 @@ def _same_endpoint(a: str, b: str) -> bool:
         and pa.netloc.lower() == pb.netloc.lower()
         and pa.path.rstrip("/") == pb.path.rstrip("/")
     )
+
+
+def _header_value(headers: Any, name: str) -> str:
+    """Read a string header from httpx or test-double header mappings."""
+    if headers is None:
+        return ""
+    try:
+        value = headers.get(name)
+        if value is None:
+            value = headers.get(name.lower())
+    except (AttributeError, TypeError):
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _challenge_field(header: str, name: str) -> str:
+    """Extract one RFC 6750-style auth parameter for challenge identity."""
+    match = re.search(
+        rf"\b{re.escape(name)}\s*=\s*(?:\"([^\"]*)\"|([^,\s]+))",
+        header,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return ""
+    return match.group(1) or match.group(2) or ""
+
+
+def _normalize_auth_challenge(response: Any) -> str:
+    """Return a stable key for a 401 OAuth challenge.
+
+    The full normalized ``WWW-Authenticate`` value preserves challenge
+    parameters beyond ``scope`` and ``resource_metadata``. The extracted
+    fields are included explicitly so callers can reason about the resource
+    and scope that define the challenged authorization request.
+    """
+    header = _header_value(getattr(response, "headers", None), "WWW-Authenticate")
+    normalized_header = " ".join(header.split()).casefold()
+    resource_metadata = " ".join(_challenge_field(header, "resource_metadata").split())
+    scope_tokens = sorted(set(_challenge_field(header, "scope").split()))
+    if not normalized_header and not resource_metadata and not scope_tokens:
+        return _DEFAULT_AUTH_CHALLENGE_KEY
+    return "|".join(
+        (
+            f"header={normalized_header}",
+            f"resource_metadata={resource_metadata}",
+            f"scope={' '.join(scope_tokens)}",
+        )
+    )
+
+
+def _normalize_auth_challenge_key(challenge_key: str | None) -> str:
+    """Normalize explicit and derived challenge keys for map lookups."""
+    if not challenge_key:
+        return _DEFAULT_AUTH_CHALLENGE_KEY
+    return " ".join(str(challenge_key).split())
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +158,62 @@ class _ProviderEntry:
     last_mtime_ns: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_401: dict[str, "asyncio.Future[bool]"] = field(default_factory=dict)
+
+
+class _TaskLocalAsyncLock:
+    """Provide one SDK-compatible lock per task driving an auth generator.
+
+    MCP 2.x keeps ``context.lock`` held across each yielded HTTP request.
+    A cached provider can have multiple auth generators in flight, so sharing
+    the SDK's one lock would block ordinary requests behind unrelated network
+    responses. Per-task locks retain the SDK's cleanup semantics without
+    serializing those independent generators.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+
+    def _lock_for_current_task(self):
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover - SDK auth always runs in a task
+            raise RuntimeError("OAuth SDK lock requires an asyncio task")
+        with self._guard:
+            lock = self._locks.get(task)
+            if lock is None:
+                try:
+                    import anyio
+                except ImportError:  # pragma: no cover - MCP depends on anyio
+                    raise RuntimeError("MCP OAuth requires anyio") from None
+                lock = anyio.Lock()
+                self._locks[task] = lock
+            return lock
+
+    async def __aenter__(self):
+        lock = self._lock_for_current_task()
+        await lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._lock_for_current_task().release()
+
+
+@dataclass
+class _AuthFlowState:
+    """Cross-loop state for one in-flight 401 authorization flow."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
+
+
+@dataclass
+class _AuthGrantState:
+    """A browser grant that can outlive a cancelled HTTP attempt."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    task: asyncio.Task | None = None
+    result: tuple[str, str] | None = None
+    error: BaseException | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -138,13 +256,55 @@ def _make_hermes_provider_class() -> Optional[type]:
         ):
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
-            self._hermes_home = ""
+            self._hermes_home: str | None = None
+            # MCP 2.x holds this lock across a yielded request. Replace the
+            # shared lock with a task-local adapter so ordinary requests do
+            # not wait at the real SDK lock boundary.
+            self.context.lock = _TaskLocalAsyncLock()
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
             # registration can't help. Only auto-heal dynamically-registered
             # clients. See _maybe_flag_poisoned_client.
             self._hermes_preregistered = preregistered
+
+        async def _perform_authorization_code_grant(self) -> tuple[str, str]:
+            """Run one browser grant across sequential connection retries."""
+            manager = get_manager()
+            hermes_home = getattr(self, "_hermes_home", None)
+            challenge_key = _CURRENT_AUTH_CHALLENGE_KEY.get()
+            grant_state, owns_grant = manager.begin_auth_grant(
+                self._hermes_server_name,
+                challenge_key=challenge_key,
+                hermes_home=hermes_home,
+            )
+
+            if owns_grant:
+                task = asyncio.create_task(
+                    super()._perform_authorization_code_grant()
+                )
+                manager.attach_auth_grant(
+                    self._hermes_server_name,
+                    grant_state,
+                    task,
+                    challenge_key=challenge_key,
+                    hermes_home=hermes_home,
+                )
+            else:
+                task = grant_state.task
+
+            if task is not None and task.get_loop() is asyncio.get_running_loop():
+                # Cancellation of this HTTP attempt must not cancel the browser
+                # grant or its callback listener.
+                return await asyncio.shield(task)
+
+            while not grant_state.done.is_set():
+                await asyncio.sleep(_AUTH_FLOW_POLL_INTERVAL)
+            if grant_state.error is not None:
+                raise grant_state.error
+            if grant_state.result is None:  # pragma: no cover - defensive
+                raise RuntimeError("OAuth authorization grant completed without a result")
+            return grant_state.result
 
         async def _initialize(self) -> None:
             """Load stored tokens + client info AND seed token_expiry_time.
@@ -204,36 +364,27 @@ def _make_hermes_provider_class() -> Optional[type]:
                         meta.token_endpoint,
                     )
 
-            # Pre-flight OAuth AS discovery so ``_refresh_token`` has a
-            # correct ``token_endpoint`` before the first refresh attempt.
-            # Only runs when we have tokens on cold-load but no cached
-            # metadata — i.e. the exact scenario where the SDK's built-in
-            # 401-branch discovery hasn't had a chance to run yet.
-            if (
-                tokens is not None
-                and self.context.oauth_metadata is None
-            ):
+            # If metadata was not persisted, discover it before the first
+            # preemptive refresh. The SDK otherwise guesses
+            # ``{server_url}/token``, which is wrong for split-origin providers
+            # such as TikTok and forces an unnecessary browser grant.
+            if tokens is not None and self.context.oauth_metadata is None:
                 try:
                     await self._prefetch_oauth_metadata()
-                except Exception as exc:  # pragma: no cover — defensive
-                    # Non-fatal: if discovery fails, the SDK's normal 401-
-                    # branch discovery will run on the next request.
+                except Exception as exc:  # pragma: no cover - best effort
                     logger.debug(
-                        "MCP OAuth '%s': pre-flight metadata discovery "
-                        "failed (non-fatal): %s",
-                        self._hermes_server_name, exc,
+                        "MCP OAuth '%s': metadata prefetch failed (non-fatal): %s",
+                        self._hermes_server_name,
+                        exc,
                     )
 
         async def _prefetch_oauth_metadata(self) -> None:
-            """Fetch PRM + ASM from the well-known endpoints, cache on context.
+            """Discover and cache protected-resource + AS metadata."""
+            try:
+                import httpx2 as sdk_httpx
+            except ImportError:  # pragma: no cover - MCP 1.x fallback
+                import httpx as sdk_httpx
 
-            Mirrors the SDK's 401-branch discovery (oauth2.py ~line 511-551)
-            but runs synchronously before the first request instead of
-            inside the httpx auth_flow generator. Uses the SDK's own URL
-            builders and response handlers so we track whatever the SDK
-            version we're pinned to expects.
-            """
-            import httpx  # local import: httpx is an MCP SDK dependency
             from mcp.client.auth.utils import (
                 build_oauth_authorization_server_metadata_discovery_urls,
                 build_protected_resource_metadata_discovery_urls,
@@ -243,21 +394,15 @@ def _make_hermes_provider_class() -> Optional[type]:
             )
 
             server_url = self.context.server_url
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # Step 1: PRM discovery to learn the authorization_server URL.
+            async with sdk_httpx.AsyncClient(timeout=10.0) as client:
                 for url in build_protected_resource_metadata_discovery_urls(
                     None, server_url
                 ):
-                    req = create_oauth_metadata_request(url)
                     try:
-                        resp = await client.send(req)
-                    except httpx.HTTPError as exc:
-                        logger.debug(
-                            "MCP OAuth '%s': PRM discovery to %s failed: %s",
-                            self._hermes_server_name, url, exc,
-                        )
+                        response = await client.send(create_oauth_metadata_request(url))
+                    except sdk_httpx.HTTPError:
                         continue
-                    prm = await handle_protected_resource_response(resp)
+                    prm = await handle_protected_resource_response(response)
                     if prm:
                         self.context.protected_resource_metadata = prm
                         if prm.authorization_servers:
@@ -266,36 +411,21 @@ def _make_hermes_provider_class() -> Optional[type]:
                             )
                         break
 
-                # Step 2: ASM discovery against the auth_server_url (or
-                # server_url fallback for legacy providers).
                 for url in build_oauth_authorization_server_metadata_discovery_urls(
                     self.context.auth_server_url, server_url
                 ):
-                    req = create_oauth_metadata_request(url)
                     try:
-                        resp = await client.send(req)
-                    except httpx.HTTPError as exc:
-                        logger.debug(
-                            "MCP OAuth '%s': ASM discovery to %s failed: %s",
-                            self._hermes_server_name, url, exc,
-                        )
+                        response = await client.send(create_oauth_metadata_request(url))
+                    except sdk_httpx.HTTPError:
                         continue
-                    ok, asm = await handle_auth_metadata_response(resp)
+                    ok, metadata = await handle_auth_metadata_response(response)
                     if not ok:
                         break
-                    if asm:
-                        self.context.oauth_metadata = asm
-                        # Persist immediately so a subsequent cold-load can
-                        # skip discovery entirely.
-                        storage = self.context.storage
+                    if metadata:
+                        self.context.oauth_metadata = metadata
                         from tools.mcp_oauth import HermesTokenStorage
-                        if isinstance(storage, HermesTokenStorage):
-                            storage.save_oauth_metadata(asm)
-                        logger.debug(
-                            "MCP OAuth '%s': pre-flight ASM discovered "
-                            "token_endpoint=%s",
-                            self._hermes_server_name, asm.token_endpoint,
-                        )
+                        if isinstance(self.context.storage, HermesTokenStorage):
+                            self.context.storage.save_oauth_metadata(metadata)
                         break
 
         def _persist_oauth_metadata_if_changed(self) -> None:
@@ -388,48 +518,107 @@ def _make_hermes_provider_class() -> Optional[type]:
                 )
 
         async def async_auth_flow(self, request):  # type: ignore[override]
-            # Pre-flow hook: ask the manager to refresh from disk if needed.
-            # Any failure here is non-fatal — we just log and proceed with
-            # whatever state the SDK already has.
+            manager = get_manager()
+            hermes_home = getattr(self, "_hermes_home", None)
+            auth_state = None
+            owns_auth_flow = False
+            challenge_key = _DEFAULT_AUTH_CHALLENGE_KEY
+            flow_error: BaseException | None = None
+            inner = None
             try:
-                await get_manager().invalidate_if_disk_changed(
-                    self._hermes_server_name,
-                    hermes_home=self._hermes_home,
-                )
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.debug(
-                    "MCP OAuth '%s': pre-flow disk-watch failed (non-fatal): %s",
-                    self._hermes_server_name, exc,
-                )
+                try:
+                    await manager.invalidate_if_disk_changed(
+                        self._hermes_server_name,
+                        hermes_home=hermes_home,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "MCP OAuth '%s': pre-flow disk-watch failed (non-fatal): %s",
+                        self._hermes_server_name,
+                        exc,
+                    )
 
-            # Manually bridge the bidirectional generator protocol. httpx's
-            # auth_flow driver (httpx._client._send_handling_auth) calls
-            # ``auth_flow.asend(response)`` to feed HTTP responses back into
-            # the generator. A naive wrapper using ``async for item in inner:
-            # yield item`` DISCARDS those .asend(response) values and resumes
-            # the inner generator with None, so the SDK's
-            # ``response = yield request`` branch in
-            # mcp/client/auth/oauth2.py sees response=None and crashes at
-            # ``if response.status_code == 401`` with AttributeError.
-            #
-            # The bridge below forwards each .asend() value into the inner
-            # generator via inner.asend(incoming), preserving the bidirectional
-            # contract. Regression from PR #11383 caught by
-            # tests/tools/test_mcp_oauth_bidirectional.py.
-            inner = super().async_auth_flow(request)
-            try:
-                outgoing = await inner.__anext__()
-                while True:
-                    incoming = yield outgoing
-                    # Sniff the response for a dead-client-registration signal
-                    # before handing it back to the SDK (best-effort, GH#36767).
-                    await self._maybe_flag_poisoned_client(incoming)
-                    outgoing = await inner.asend(incoming)
-            except StopAsyncIteration:
-                # Persist any metadata the SDK discovered lazily during the
-                # 401 branch so a subsequent cold-load skips discovery.
-                self._persist_oauth_metadata_if_changed()
-                return
+                # Preserve the bidirectional async-generator contract: each
+                # response received through .asend() must reach the SDK.
+                inner = super().async_auth_flow(request)
+                try:
+                    outgoing = await inner.__anext__()
+                except StopAsyncIteration:
+                    self._persist_oauth_metadata_if_changed()
+                    return
+
+                try:
+                    while True:
+                        incoming = yield outgoing
+                        await self._maybe_flag_poisoned_client(incoming)
+
+                        if (
+                            auth_state is None
+                            and getattr(incoming, "status_code", None) == 401
+                        ):
+                            challenge_key = _normalize_auth_challenge(incoming)
+                            auth_state, owns_auth_flow = manager.begin_auth_flow(
+                                self._hermes_server_name,
+                                challenge_key=challenge_key,
+                                hermes_home=hermes_home,
+                            )
+                            if not owns_auth_flow:
+                                # Another flow owns the challenge. Do not feed
+                                # this stale 401 into a second SDK grant.
+                                while not auth_state.done.is_set():
+                                    await asyncio.sleep(_AUTH_FLOW_POLL_INTERVAL)
+                                if auth_state.error is not None:
+                                    raise auth_state.error
+                                await inner.aclose()
+                                self._add_auth_header(request)
+                                retry_response = yield request
+                                await self._maybe_flag_poisoned_client(retry_response)
+                                return
+
+                        challenge_token = _CURRENT_AUTH_CHALLENGE_KEY.set(
+                            challenge_key if auth_state is not None else None
+                        )
+                        try:
+                            outgoing = await inner.asend(incoming)
+                        finally:
+                            _CURRENT_AUTH_CHALLENGE_KEY.reset(challenge_token)
+                except StopAsyncIteration:
+                    self._persist_oauth_metadata_if_changed()
+                    return
+            except BaseException as exc:
+                flow_error = exc
+                raise
+            finally:
+                if inner is not None:
+                    try:
+                        await inner.aclose()
+                    except (RuntimeError, OSError):  # pragma: no cover - cleanup
+                        logger.debug(
+                            "MCP OAuth '%s': inner auth-flow cleanup failed",
+                            self._hermes_server_name,
+                            exc_info=True,
+                        )
+                if owns_auth_flow and auth_state is not None:
+                    manager.finish_auth_flow(
+                        self._hermes_server_name,
+                        auth_state,
+                        error=flow_error,
+                        challenge_key=challenge_key,
+                        hermes_home=hermes_home,
+                    )
+                if auth_state is not None and (
+                    flow_error is None
+                    or manager.auth_grant_is_done(
+                        self._hermes_server_name,
+                        challenge_key=challenge_key,
+                        hermes_home=hermes_home,
+                    )
+                ):
+                    manager.clear_auth_grant(
+                        self._hermes_server_name,
+                        challenge_key=challenge_key,
+                        hermes_home=hermes_home,
+                    )
 
     return HermesMCPOAuthProvider
 
@@ -454,6 +643,8 @@ class MCPOAuthManager:
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str], _ProviderEntry] = {}
         self._entries_lock = threading.Lock()
+        self._inflight_auth_flows: dict[tuple[str, str, str], _AuthFlowState] = {}
+        self._inflight_auth_grants: dict[tuple[str, str, str], _AuthGrantState] = {}
         # Holds strong references to in-flight 401 handler tasks so the
         # event loop's weak-reference bookkeeping cannot GC them mid-run
         # and leave `await pending` waiters hanging forever.
@@ -508,6 +699,17 @@ class MCPOAuthManager:
 
         home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
         return (str(home.expanduser().resolve(strict=False)), server_name)
+
+    @classmethod
+    def _auth_key(
+        cls,
+        server_name: str,
+        hermes_home: str | Path | None = None,
+        challenge_key: str | None = None,
+    ) -> tuple[str, str, str]:
+        """Build the profile/server/challenge key for OAuth single-flight state."""
+        home, name = cls._key(server_name, hermes_home)
+        return home, name, _normalize_auth_challenge_key(challenge_key)
 
     def _build_provider(
         self,
@@ -574,7 +776,13 @@ class MCPOAuthManager:
 
         resolved_port = cfg.get("_resolved_port", 0)
         redirect_handler = _make_redirect_handler(resolved_port)
-        callback_handler = _make_callback_waiter(resolved_port)
+        # MCP 2.x removed OAuthClientProvider's timeout argument. Keep the
+        # configured timeout at the callback boundary instead.
+        callback_handler = _make_callback_waiter(
+            resolved_port,
+            timeout=float(cfg.get("timeout", 300)),
+            sdk_result=True,
+        )
 
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
@@ -584,7 +792,6 @@ class MCPOAuthManager:
             storage=storage,
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
-            timeout=float(cfg.get("timeout", 300)),
         )
 
     def remove(
@@ -598,8 +805,31 @@ class MCPOAuthManager:
         Called by ``hermes mcp remove <name>`` and (indirectly) by
         ``hermes mcp login <name>`` during forced re-auth.
         """
+        key = self._key(server_name, hermes_home)
         with self._entries_lock:
-            entry = self._entries.pop(self._key(server_name, hermes_home), None)
+            entry = self._entries.pop(key, None)
+            flow_keys = [
+                flow_key
+                for flow_key in self._inflight_auth_flows
+                if flow_key[:2] == key
+            ]
+            for flow_key in flow_keys:
+                self._inflight_auth_flows.pop(flow_key, None)
+            grant_keys = [
+                grant_key
+                for grant_key in self._inflight_auth_grants
+                if grant_key[:2] == key
+            ]
+            grants = [self._inflight_auth_grants.pop(grant_key) for grant_key in grant_keys]
+
+        for grant in grants:
+            if grant.task is not None and not grant.task.done():
+                try:
+                    loop = grant.task.get_loop()
+                    if loop.is_running():
+                        loop.call_soon_threadsafe(grant.task.cancel)
+                except (RuntimeError, OSError):  # pragma: no cover - best effort
+                    pass
 
         from tools.mcp_oauth import remove_oauth_tokens
         remove_oauth_tokens(server_name, hermes_home=hermes_home)
@@ -631,6 +861,116 @@ class MCPOAuthManager:
         """Drop only the in-process provider, preserving persisted OAuth state."""
         with self._entries_lock:
             self._entries.pop(self._key(server_name, hermes_home), None)
+
+    # -- Authorization-code single flight -----------------------------------
+
+    def begin_auth_flow(
+        self,
+        server_name: str,
+        *,
+        challenge_key: str | None = None,
+        hermes_home: str | Path | None = None,
+    ) -> tuple[_AuthFlowState, bool]:
+        """Join or create one in-flight 401 flow for this challenge."""
+        key = self._auth_key(server_name, hermes_home, challenge_key)
+        with self._entries_lock:
+            state = self._inflight_auth_flows.get(key)
+            if state is not None:
+                return state, False
+            state = _AuthFlowState()
+            self._inflight_auth_flows[key] = state
+            return state, True
+
+    def finish_auth_flow(
+        self,
+        server_name: str,
+        state: _AuthFlowState,
+        *,
+        error: BaseException | None = None,
+        challenge_key: str | None = None,
+        hermes_home: str | Path | None = None,
+    ) -> None:
+        """Publish an auth-flow result and release cross-loop waiters."""
+        key = self._auth_key(server_name, hermes_home, challenge_key)
+        with self._entries_lock:
+            if self._inflight_auth_flows.get(key) is state:
+                self._inflight_auth_flows.pop(key, None)
+            state.error = error
+            state.done.set()
+
+    def begin_auth_grant(
+        self,
+        server_name: str,
+        *,
+        challenge_key: str | None = None,
+        hermes_home: str | Path | None = None,
+    ) -> tuple[_AuthGrantState, bool]:
+        """Join or create a challenge-scoped grant that survives cancellation."""
+        key = self._auth_key(server_name, hermes_home, challenge_key)
+        with self._entries_lock:
+            state = self._inflight_auth_grants.get(key)
+            if state is not None:
+                return state, False
+            state = _AuthGrantState()
+            self._inflight_auth_grants[key] = state
+            return state, True
+
+    def attach_auth_grant(
+        self,
+        server_name: str,
+        state: _AuthGrantState,
+        task: asyncio.Task,
+        *,
+        challenge_key: str | None = None,
+        hermes_home: str | Path | None = None,
+    ) -> None:
+        """Attach a grant task and publish its result to later retries."""
+        key = self._auth_key(server_name, hermes_home, challenge_key)
+        with self._entries_lock:
+            if self._inflight_auth_grants.get(key) is not state:
+                return
+            state.task = task
+
+        def _complete(completed: asyncio.Task) -> None:
+            try:
+                result = completed.result()
+                if not isinstance(result, tuple) or len(result) != 2:
+                    raise RuntimeError(
+                        "OAuth authorization grant returned an invalid result"
+                    )
+                state.result = (str(result[0]), str(result[1]))
+            except BaseException as exc:
+                state.error = exc
+            finally:
+                state.done.set()
+
+        task.add_done_callback(_complete)
+
+    def auth_grant_is_done(
+        self,
+        server_name: str,
+        *,
+        challenge_key: str | None = None,
+        hermes_home: str | Path | None = None,
+    ) -> bool:
+        """Return whether the current shared browser grant has completed."""
+        key = self._auth_key(server_name, hermes_home, challenge_key)
+        with self._entries_lock:
+            state = self._inflight_auth_grants.get(key)
+            return state is not None and state.done.is_set()
+
+    def clear_auth_grant(
+        self,
+        server_name: str,
+        *,
+        challenge_key: str | None = None,
+        hermes_home: str | Path | None = None,
+    ) -> None:
+        """Forget a completed or consumed one-use browser grant."""
+        with self._entries_lock:
+            self._inflight_auth_grants.pop(
+                self._auth_key(server_name, hermes_home, challenge_key), None
+            )
 
     # -- Disk watch ----------------------------------------------------------
 

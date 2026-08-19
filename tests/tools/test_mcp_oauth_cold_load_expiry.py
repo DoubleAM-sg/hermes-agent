@@ -310,7 +310,10 @@ async def test_initialize_prefetches_oauth_metadata_when_missing(
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-    import httpx
+    try:
+        import httpx2 as httpx
+    except ImportError:
+        import httpx
     from mcp.shared.auth import (
         OAuthClientInformationFull,
         OAuthClientMetadata,
@@ -378,9 +381,7 @@ async def test_initialize_prefetches_oauth_metadata_when_missing(
 
     transport = httpx.MockTransport(mock_handler)
 
-    # Patch the AsyncClient constructor used by _prefetch_oauth_metadata so
-    # it uses our mock transport instead of the real network.
-    import httpx as real_httpx
+    real_httpx = httpx
 
     original_async_client = real_httpx.AsyncClient
 
