@@ -867,7 +867,7 @@ def _make_callback_waiter(
     port: int,
     *,
     timeout: float = 300.0,
-    sdk_result: bool = False,
+    sdk_result: bool = True,
 ):
     """Return a callback waiter bound to a single OAuth flow's port.
 
